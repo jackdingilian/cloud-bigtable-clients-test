@@ -236,6 +236,17 @@ type readModifyWriteRowAction struct {
 }
 func (a *readModifyWriteRowAction) Validate() {}
 
+ // TODO docs
+type executeQueryAction struct {
+	response      *btpb.ExecuteQueryResponse
+	rpcError      codes.Code
+	delayStr      string  // "" means zero delay; follow https://pkg.go.dev/time#ParseDuration otherwise
+	routingCookie string
+	retryInfo     string  // "" means no RetryInfo will be attached in the error status
+	endOfStream   bool   // If true, server will conclude the serving stream for the request.
+}
+func (a *executeQueryAction) Validate() {}
+
 // readRowsReqRecord allows the mock server to record the received ReadRowsRequest with timestamp.
 type readRowsReqRecord struct {
 	req *btpb.ReadRowsRequest
@@ -278,11 +289,17 @@ type readModifyWriteRowReqRecord struct {
 }
 func (r *readModifyWriteRowReqRecord) GetTs() time.Time {return r.ts}
 
+type executeQueryReqRecord struct {
+	req *btpb.ExecuteQueryRequest
+	ts time.Time
+}
+func (r *executeQueryReqRecord) GetTs() time.Time {return r.ts}
+
 // anyRequest is an interface type that works for the request types of test proxy.
 type anyRequest interface {
 	*testproxypb.ReadRowRequest | *testproxypb.ReadRowsRequest | *testproxypb.MutateRowRequest |
 	*testproxypb.MutateRowsRequest | *testproxypb.SampleRowKeysRequest |
-	*testproxypb.CheckAndMutateRowRequest | *testproxypb.ReadModifyWriteRowRequest
+	*testproxypb.CheckAndMutateRowRequest | *testproxypb.ReadModifyWriteRowRequest | *testproxypb.ExecuteQueryRequest
 	GetClientId() string
 }
 
@@ -290,21 +307,21 @@ type anyRequest interface {
 type anyResult interface {
 	*testproxypb.RowResult | *testproxypb.RowsResult | *testproxypb.MutateRowResult |
 	*testproxypb.MutateRowsResult | *testproxypb.SampleRowKeysResult |
-	*testproxypb.CheckAndMutateRowResult
+	*testproxypb.CheckAndMutateRowResult | *testproxypb.ExecuteQueryResult
 	GetStatus() *status.Status
 }
 
 // anyRecord is an interface type that works for the record types defined above.
 type anyRecord interface {
 	*readRowsReqRecord | *sampleRowKeysReqRecord | *mutateRowReqRecord | *mutateRowsReqRecord |
-	*checkAndMutateRowReqRecord | *readModifyWriteRowReqRecord
+	*checkAndMutateRowReqRecord | *readModifyWriteRowReqRecord | *executeQueryReqRecord
 	GetTs() time.Time
 }
 
 // anyAction is an interface type that works for the action types of mock server, except for sampleRowKeysAction.
 type anyAction interface {
 	*readRowsAction | *mutateRowAction | *mutateRowsAction |
-	*checkAndMutateRowAction | *readModifyWriteRowAction
+	*checkAndMutateRowAction | *readModifyWriteRowAction | *executeQueryAction
 	Validate()
 }
 

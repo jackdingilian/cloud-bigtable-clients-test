@@ -556,3 +556,88 @@ func mockReadModifyWriteRowFn(recorder chan<- *readModifyWriteRowReqRecord, acti
 	}
 }
 
+// mockExecuteQueryFnSimple is a simple wrapper of mockExecuteQueryFn. It's useful when server only performs
+// one action per request, as users don't need to assemble an array of actions per request.
+func mockExecuteQueryFn(recorder chan<- *executeQueryReqRecord, actionSequences ...*executeQueryAction) func(*btpb.ExecuteQueryRequest, btpb.Bigtable_ExecuteQueryServer) error {
+	return mockExecuteQueryFnWithMetadata(recorder, nil, actionSequences...)
+}
+
+// mockExecuteQueryFn returns a mock implementation of server-side ExecuteQuery(). The behavior is
+// customized by `actionSequences`. Non-nil `recorder` will be used to log the requests
+// (including retries) received by the server in time order, up to its capacity.
+func mockExecuteQueryFnWithMetadata(recorder chan<- *executeQueryReqRecord, mdRecorder chan metadata.MD, actionSequences ...*executeQueryAction) func(*btpb.ExecuteQueryRequest, btpb.Bigtable_ExecuteQueryServer) error {
+	// Convert the action sequence to a queue for server to consume.
+	actionQueue := make(chan *executeQueryAction, len(actionSequences))
+	for _, action := range actionSequences {
+		action.Validate()
+		actionQueue <- action
+	}
+	close(actionQueue)
+
+	return func(req *btpb.ExecuteQueryRequest, srv btpb.Bigtable_ExecuteQueryServer) error {
+		if *printClientReq {
+			serverLogger.Printf("Request from client: %+v", req)
+		}
+
+		// Record the metadata
+		if (mdRecorder != nil) {
+			md, _ := metadata.FromIncomingContext(srv.Context())
+			mdRecorder <- md
+		}
+
+		// Record the request
+		reqRecord := &executeQueryReqRecord{
+			req: req,
+			ts:  time.Now(),
+		}
+		saveReqRecord(recorder, reqRecord)
+
+		
+		// var rowKey []byte
+		// if req.GetRows() != nil && len(req.GetRows().GetRowKeys()) > 0 {
+		// 	rowKey = req.GetRows().GetRowKeys()[0]
+		// } else if len(opIDToActionQueue) > 1 {
+		// 	return gs.Error(codes.InvalidArgument, "The ReadRows request must contain rowkeys for concurrency testing")
+		// }
+
+		// // actionQueue, err := retrieveActions(opIDToActionQueue, rowKey)
+		// if err != nil {
+		// 	return err
+		// }
+
+		// Perform the actions
+		for {
+			action, more := <-actionQueue
+			if !more {
+				break
+			}
+			sleepFor(action.delayStr)
+
+			if action.rpcError != codes.OK {
+				if action.routingCookie != "" {
+					// add routing cookie to metadata
+					trailer := metadata.Pairs("x-goog-cbt-cookie-test", action.routingCookie)
+					srv.SetTrailer(trailer)
+				}
+				// TODO check for feature flag
+				if action.retryInfo != "" {
+					st := gs.New(action.rpcError, "ExecuteQuery failed")
+					delay, _ := time.ParseDuration(action.retryInfo)
+					retryInfo := &errdetails.RetryInfo{
+						RetryDelay: drpb.New(delay),
+					}
+					st, _ = st.WithDetails(retryInfo)
+					return st.Err()
+				}
+				return gs.Error(action.rpcError, "ExecuteQuery failed")
+			}
+	
+			srv.Send(action.response)
+
+			if action.endOfStream {
+				return nil
+			}
+		}
+		return nil
+	}
+}
