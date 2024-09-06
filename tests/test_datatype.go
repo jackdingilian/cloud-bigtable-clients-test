@@ -236,7 +236,21 @@ type readModifyWriteRowAction struct {
 }
 func (a *readModifyWriteRowAction) Validate() {}
 
- // TODO docs
+// executeQueryAction denotes an error or a response in the response stream for an ExecuteQuery request.
+// Usage:
+//  1. executeQueryAction{response: res}
+//     Effect: server will return response, and there may be more to come.
+//  2. executeQueryAction{response: res, delayStr: delay}
+//     Effect: server will return the response after delay, and there may be more to come.
+//  3. executeQueryAction{rpcError: error}
+//     Effect: server will return an error. response specified in the same action will be ignored.
+//  4. executeQueryAction{rpcError: error, delayStr: delay}
+//     Effect: server will return an error after delay. response specified in the same action will be ignored.
+//  5. executeQueryAction{rpcError: error, routingCookie: cookie}
+//     Effect: server will return an error with the routing cookie. Retry attempt header should have this cookie.
+//  6. executeQueryAction{rpcError: error, retryInfo: delay}
+//     Effect: server will return an error with RetryInfo which has the specific delay.
+//  7. To have a response stream with/without errors, a sequence of actions should be constructed.
 type executeQueryAction struct {
 	response      *btpb.ExecuteQueryResponse
 	rpcError      codes.Code

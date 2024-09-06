@@ -592,19 +592,6 @@ func mockExecuteQueryFnWithMetadata(recorder chan<- *executeQueryReqRecord, mdRe
 		}
 		saveReqRecord(recorder, reqRecord)
 
-		
-		// var rowKey []byte
-		// if req.GetRows() != nil && len(req.GetRows().GetRowKeys()) > 0 {
-		// 	rowKey = req.GetRows().GetRowKeys()[0]
-		// } else if len(opIDToActionQueue) > 1 {
-		// 	return gs.Error(codes.InvalidArgument, "The ReadRows request must contain rowkeys for concurrency testing")
-		// }
-
-		// // actionQueue, err := retrieveActions(opIDToActionQueue, rowKey)
-		// if err != nil {
-		// 	return err
-		// }
-
 		// Perform the actions
 		for {
 			action, more := <-actionQueue
@@ -619,7 +606,6 @@ func mockExecuteQueryFnWithMetadata(recorder chan<- *executeQueryReqRecord, mdRe
 					trailer := metadata.Pairs("x-goog-cbt-cookie-test", action.routingCookie)
 					srv.SetTrailer(trailer)
 				}
-				// TODO check for feature flag
 				if action.retryInfo != "" {
 					st := gs.New(action.rpcError, "ExecuteQuery failed")
 					delay, _ := time.ParseDuration(action.retryInfo)
