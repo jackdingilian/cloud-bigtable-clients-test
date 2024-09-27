@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"math"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -91,7 +92,8 @@ func TestExecuteQuery_EmptyResponse(t *testing.T) {
 	recorder := make(chan *executeQueryReqRecord, 1)
 	server := initMockServer(t)
 	server.ExecuteQueryFn = mockExecuteQueryFn(recorder, &executeQueryAction{
-		response: md(column("test", strType())),
+		response:    md(column("test", strType())),
+		endOfStream: true,
 	})
 	req := testproxypb.ExecuteQueryRequest{
 		ClientId: t.Name(),
@@ -974,7 +976,7 @@ func TestExecuteQuery_HeadersAreSet(t *testing.T) {
 
 	recorder := make(chan *executeQueryReqRecord, 1)
 	mdRecorder := make(chan metadata.MD, 1)
-	server.ExecuteQueryFn = mockExecuteQueryFnWithMetadata(recorder, mdRecorder,
+	server.ExecuteQueryFn = mockExecuteQueryFnWithMetadataSimple(recorder, mdRecorder,
 		&executeQueryAction{
 			response: md(
 				column("foo", strType()),
@@ -1055,5 +1057,215 @@ func TestExecuteQuery_RespectsDeadline(t *testing.T) {
 	}
 }
 
-// TODO test concurrent reqs
-// TODO testing closing client
+func TestExecuteQuery_ConcurrentRequests(t *testing.T) {
+	concurrency := 5
+
+	recorder := make(chan *executeQueryReqRecord, concurrency)
+	actionSequences := [][]*executeQueryAction{
+		[]*executeQueryAction{
+			&executeQueryAction{
+				response:    md(column("strCol", strType())),
+				delayStr:    "2s",
+				endOfStream: false,
+			},
+			&executeQueryAction{
+				response:    partialResultSet("token", strVal("foo"), strVal("bar"), strVal("baz")),
+				endOfStream: true,
+			},
+		},
+		[]*executeQueryAction{
+			&executeQueryAction{
+				response:    md(column("intCol", int64Type()), column("boolCol", boolType())),
+				delayStr:    "2s",
+				endOfStream: false,
+			},
+			&executeQueryAction{
+				response:    partialResultSet("token", intVal(1), boolVal(true)),
+				delayStr:    "2s",
+				endOfStream: false,
+			},
+			&executeQueryAction{
+				response:    partialResultSet("token", intVal(2), boolVal(false)),
+				delayStr:    "2s",
+				endOfStream: true,
+			},
+		},
+		[]*executeQueryAction{
+			&executeQueryAction{
+				response:    md(column("mapCol", mapType(strType(), strType())), column("strCol", strType())),
+				delayStr:    "2s",
+				endOfStream: false,
+			},
+			&executeQueryAction{
+				response:    partialResultSet("token", mapVal(mapEntry(strVal("k"), strVal("v"))), strVal("foo")),
+				delayStr:    "2s",
+				endOfStream: true,
+			},
+		},
+		[]*executeQueryAction{
+			&executeQueryAction{
+				response:    md(column("strCol", strType()), column("bytesCol", bytesType())),
+				delayStr:    "2s",
+				endOfStream: true,
+			},
+		},
+		[]*executeQueryAction{
+			&executeQueryAction{
+				response:    md(column("arrayOfString", arrayType(strType()))),
+				delayStr:    "2s",
+				endOfStream: false,
+			},
+			&executeQueryAction{
+				response:    partialResultSet("token", arrayVal(strVal("e1"), strVal("e2")), arrayVal(strVal("f1"), strVal("f2"))),
+				delayStr:    "2s",
+				endOfStream: true,
+			},
+		},
+	}
+
+	server := initMockServer(t)
+	server.ExecuteQueryFn = mockExecuteQueryFnWithMetadata(recorder, nil, actionSequences)
+
+	reqs := make([]*testproxypb.ExecuteQueryRequest, concurrency)
+	for i := 0; i < concurrency; i++ {
+		reqs[i] = &testproxypb.ExecuteQueryRequest{
+			ClientId: t.Name(),
+			Request: &btpb.ExecuteQueryRequest{
+				InstanceName: instanceName,
+				Query:        strconv.Itoa(i),
+			},
+		}
+	}
+
+	results := doExecuteQueryOps(t, server, reqs, nil)
+
+	assert.Equal(t, concurrency, len(recorder))
+
+	// request1
+	checkResultOkStatus(t, results[0])
+	assert.Equal(t, len(results[0].Metadata.Columns), 1)
+	assert.True(t, cmp.Equal(results[0].Metadata, testProxyMd(column("strCol", strType())), protocmp.Transform()))
+	assert.Equal(t, len(results[0].Rows), 3)
+	assertRowEqual(t, testProxyRow(strVal("foo")), results[0].Rows[0], results[0].Metadata)
+	assertRowEqual(t, testProxyRow(strVal("bar")), results[0].Rows[1], results[0].Metadata)
+	assertRowEqual(t, testProxyRow(strVal("baz")), results[0].Rows[2], results[0].Metadata)
+
+	// request2
+	checkResultOkStatus(t, results[1])
+	assert.Equal(t, len(results[1].Metadata.Columns), 2)
+	assert.True(t, cmp.Equal(results[1].Metadata, testProxyMd(column("intCol", int64Type()), column("boolCol", boolType())), protocmp.Transform()))
+	assert.Equal(t, len(results[1].Rows), 2)
+	assertRowEqual(t, testProxyRow(intVal(1), boolVal(true)), results[1].Rows[0], results[1].Metadata)
+	assertRowEqual(t, testProxyRow(intVal(2), boolVal(false)), results[1].Rows[1], results[1].Metadata)
+
+	// request3
+	checkResultOkStatus(t, results[2])
+	assert.Equal(t, len(results[2].Metadata.Columns), 2)
+	assert.True(t, cmp.Equal(results[2].Metadata, testProxyMd(column("mapCol", mapType(strType(), strType())), column("strCol", strType())), protocmp.Transform()))
+	assert.Equal(t, len(results[2].Rows), 1)
+	assertRowEqual(t, testProxyRow(mapVal(mapEntry(strVal("k"), strVal("v"))), strVal("foo")), results[2].Rows[0], results[2].Metadata)
+
+	// request4
+	checkResultOkStatus(t, results[3])
+	assert.Equal(t, len(results[3].Metadata.Columns), 2)
+	assert.True(t, cmp.Equal(results[3].Metadata, testProxyMd(column("strCol", strType()), column("bytesCol", bytesType())), protocmp.Transform()))
+	assert.Equal(t, len(results[3].Rows), 0)
+
+	// request5
+	checkResultOkStatus(t, results[4])
+	assert.Equal(t, len(results[4].Metadata.Columns), 1)
+	assert.True(t, cmp.Equal(results[4].Metadata, testProxyMd(column("arrayOfString", arrayType(strType()))), protocmp.Transform()))
+	assert.Equal(t, len(results[4].Rows), 2)
+	assertRowEqual(t, testProxyRow(arrayVal(strVal("e1"), strVal("e2"))), results[4].Rows[0], results[4].Metadata)
+	assertRowEqual(t, testProxyRow(arrayVal(strVal("f1"), strVal("f2"))), results[4].Rows[1], results[4].Metadata)
+}
+
+// tests that client doesn't kill inflight requests after client closing, but will reject new requests.
+func TestExecuteQuery_CloseClient(t *testing.T) {
+	clientID := t.Name()
+	recorder := make(chan *executeQueryReqRecord, 4)
+
+	repeatedAction := []*executeQueryAction{
+		&executeQueryAction{
+			response:    md(column("strCol", strType())),
+			delayStr:    "2s",
+			endOfStream: false,
+		},
+		&executeQueryAction{
+			response:    partialResultSet("token", strVal("foo")),
+			endOfStream: true,
+		},
+	}
+
+	actionSequences := [][]*executeQueryAction{
+		repeatedAction, repeatedAction, repeatedAction, repeatedAction,
+	}
+	server := initMockServer(t)
+	server.ExecuteQueryFn = mockExecuteQueryFnWithMetadata(recorder, nil, actionSequences)
+
+	// Will be finished
+	reqsBatchOne := []*testproxypb.ExecuteQueryRequest{
+		&testproxypb.ExecuteQueryRequest{
+			ClientId: t.Name(),
+			Request: &btpb.ExecuteQueryRequest{
+				InstanceName: instanceName,
+				Query:        "0",
+			},
+		},
+		&testproxypb.ExecuteQueryRequest{
+			ClientId: t.Name(),
+			Request: &btpb.ExecuteQueryRequest{
+				InstanceName: instanceName,
+				Query:        "1",
+			},
+		},
+	}
+	// Will be rejected by client
+	reqsBatchTwo := []*testproxypb.ExecuteQueryRequest{
+		&testproxypb.ExecuteQueryRequest{
+			ClientId: t.Name(),
+			Request: &btpb.ExecuteQueryRequest{
+				InstanceName: instanceName,
+				Query:        "2",
+			},
+		},
+		&testproxypb.ExecuteQueryRequest{
+			ClientId: t.Name(),
+			Request: &btpb.ExecuteQueryRequest{
+				InstanceName: instanceName,
+				Query:        "4",
+			},
+		},
+	}
+
+	setUp(t, server, clientID, nil)
+	defer tearDown(t, server, clientID)
+
+	closeClientAfter := time.Second
+	resultsBatchOne := doExecuteQueryOpsCore(t, clientID, reqsBatchOne, &closeClientAfter)
+	resultsBatchTwo := doExecuteQueryOpsCore(t, clientID, reqsBatchTwo, nil)
+
+	// Check that server only receives batch-one requests
+	assert.Equal(t, 2, len(recorder))
+
+	// Check that all the batch-one requests succeeded or were cancelled
+	checkResultOkOrCancelledStatus(t, resultsBatchOne...)
+	for i := 0; i < 2; i++ {
+		assert.NotNil(t, resultsBatchOne[i])
+		if resultsBatchOne[i] == nil {
+			continue
+		}
+		resCode := resultsBatchOne[i].GetStatus().GetCode()
+		if resCode == int32(codes.Canceled) {
+			continue
+		}
+		assert.Equal(t, len(resultsBatchOne[i].Metadata.Columns), 1)
+		assert.True(t, cmp.Equal(resultsBatchOne[i].Metadata, testProxyMd(column("strCol", strType())), protocmp.Transform()))
+		assert.Equal(t, len(resultsBatchOne[i].Rows), 1)
+		assertRowEqual(t, testProxyRow(strVal("foo")), resultsBatchOne[i].Rows[0], resultsBatchOne[i].Metadata)
+	}
+
+	// Check that all the batch-two requests failed at the proxy level
+	assert.NotEmpty(t, resultsBatchTwo[0].GetStatus().GetCode())
+	assert.NotEmpty(t, resultsBatchTwo[1].GetStatus().GetCode())
+}

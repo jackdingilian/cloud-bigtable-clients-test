@@ -20,6 +20,7 @@ import (
 	"log"
 	"os"
 	"regexp"
+	"strconv"
 	"time"
 
 	"github.com/golang/protobuf/ptypes/wrappers"
@@ -52,7 +53,8 @@ func sleepFor(duration string) {
 // expandDim inserts a length 1 dimension to the input array, and returns the resultant 2-D array.
 // Input: [a1_for_req1, a2_for_req2, ..., aN_for_reqN] -- There is one action per request.
 // Output: [[a1_for_req1], [a2_for_req2], ..., [aN_for_reqN]]
-//         -- There is one action sequence per request, and each sequence only contains one element.
+//
+//	-- There is one action sequence per request, and each sequence only contains one element.
 func expandDim[A anyAction](actions []A) [][]A {
 	actionSequences := make([][]A, len(actions))
 	for i, action := range actions {
@@ -107,7 +109,7 @@ func retrieveActions[A anyAction](opIDToActionQueue map[string]chan A, rowKey []
 	var ok bool
 	var actionQueue chan A
 	if actionQueue, ok = opIDToActionQueue[string(prefix)]; !ok {
-		return nil, gs.Error(codes.InvalidArgument, "Didn't find actions with key " + string(prefix))
+		return nil, gs.Error(codes.InvalidArgument, "Didn't find actions with key "+string(prefix))
 	}
 
 	return actionQueue, nil
@@ -140,7 +142,7 @@ func mockReadRowsFnWithMetadata(recorder chan<- *readRowsReqRecord, mdRecorder c
 		}
 
 		// Record the metadata
-		if (mdRecorder != nil) {
+		if mdRecorder != nil {
 			md, _ := metadata.FromIncomingContext(srv.Context())
 			mdRecorder <- md
 		}
@@ -194,7 +196,7 @@ func mockReadRowsFnWithMetadata(recorder chan<- *readRowsReqRecord, mdRecorder c
 
 			res := &btpb.ReadRowsResponse{}
 			var lastRowKey []byte
-			for _, chunk := range action.chunks{
+			for _, chunk := range action.chunks {
 				if chunk.status == Drop {
 					lastRowKey = chunk.rowKey
 					continue
@@ -256,7 +258,7 @@ func mockSampleRowKeysFnWithMetadata(recorder chan<- *sampleRowKeysReqRecord, md
 		}
 
 		// Record the metadata
-		if (mdRecorder != nil) {
+		if mdRecorder != nil {
 			md, _ := metadata.FromIncomingContext(srv.Context())
 			mdRecorder <- md
 		}
@@ -276,7 +278,7 @@ func mockSampleRowKeysFnWithMetadata(recorder chan<- *sampleRowKeysReqRecord, md
 			sleepFor(action.delayStr)
 
 			if action.rpcError != codes.OK {
-				if (action.routingCookie != "") {
+				if action.routingCookie != "" {
 					// add routing cookie to metadata
 					trailer := metadata.Pairs("x-goog-cbt-cookie-test", action.routingCookie)
 					srv.SetTrailer(trailer)
@@ -382,7 +384,7 @@ func mockMutateRowsFnWithMetadata(recorder chan<- *mutateRowsReqRecord, mdRecord
 		}
 
 		// Record the metadata
-		if (mdRecorder != nil) {
+		if mdRecorder != nil {
 			md, _ := metadata.FromIncomingContext(srv.Context())
 			mdRecorder <- md
 		}
@@ -416,7 +418,7 @@ func mockMutateRowsFnWithMetadata(recorder chan<- *mutateRowsReqRecord, mdRecord
 			sleepFor(action.delayStr)
 
 			if action.rpcError != codes.OK {
-				if (action.routingCookie != "") {
+				if action.routingCookie != "" {
 					// add routing cookie to metadata
 					trailer := metadata.Pairs("x-goog-cbt-cookie-test", action.routingCookie)
 					srv.SetTrailer(trailer)
@@ -558,29 +560,49 @@ func mockReadModifyWriteRowFn(recorder chan<- *readModifyWriteRowReqRecord, acti
 
 // mockExecuteQueryFnSimple is a simple wrapper of mockExecuteQueryFn. It's useful when server only performs
 // one action per request, as users don't need to assemble an array of actions per request.
-func mockExecuteQueryFn(recorder chan<- *executeQueryReqRecord, actionSequences ...*executeQueryAction) func(*btpb.ExecuteQueryRequest, btpb.Bigtable_ExecuteQueryServer) error {
-	return mockExecuteQueryFnWithMetadata(recorder, nil, actionSequences...)
+func mockExecuteQueryFn(recorder chan<- *executeQueryReqRecord, actionSequence ...*executeQueryAction) func(*btpb.ExecuteQueryRequest, btpb.Bigtable_ExecuteQueryServer) error {
+	return mockExecuteQueryFnWithMetadataSimple(recorder, nil, actionSequence...)
+}
+
+// helper for using mockExecuteQueryFnWithMetadata with a single action sequence
+func mockExecuteQueryFnWithMetadataSimple(recorder chan<- *executeQueryReqRecord, mdRecorder chan metadata.MD, actionSequence ...*executeQueryAction) func(*btpb.ExecuteQueryRequest, btpb.Bigtable_ExecuteQueryServer) error {
+	actionSequences := make([][]*executeQueryAction, 1)
+	actionSequences[0] = actionSequence
+	return mockExecuteQueryFnWithMetadata(recorder, mdRecorder, actionSequences)
 }
 
 // mockExecuteQueryFn returns a mock implementation of server-side ExecuteQuery(). The behavior is
 // customized by `actionSequences`. Non-nil `recorder` will be used to log the requests
 // (including retries) received by the server in time order, up to its capacity.
-func mockExecuteQueryFnWithMetadata(recorder chan<- *executeQueryReqRecord, mdRecorder chan metadata.MD, actionSequences ...*executeQueryAction) func(*btpb.ExecuteQueryRequest, btpb.Bigtable_ExecuteQueryServer) error {
-	// Convert the action sequence to a queue for server to consume.
-	actionQueue := make(chan *executeQueryAction, len(actionSequences))
-	for _, action := range actionSequences {
-		action.Validate()
-		actionQueue <- action
-	}
-	close(actionQueue)
-
+// If only one actionSequence is specified then it is used for all requests. If multiple are
+// specified this expects the Request Query to be the index of the sequence it should use.
+func mockExecuteQueryFnWithMetadata(recorder chan<- *executeQueryReqRecord, mdRecorder chan metadata.MD, actionSequences [][]*executeQueryAction) func(*btpb.ExecuteQueryRequest, btpb.Bigtable_ExecuteQueryServer) error {
 	return func(req *btpb.ExecuteQueryRequest, srv btpb.Bigtable_ExecuteQueryServer) error {
 		if *printClientReq {
 			serverLogger.Printf("Request from client: %+v", req)
 		}
 
+		// if there is only one action sequence use it. Otherwise
+		// we assume the query string is an int of the sequence index
+		var selectedActionSequence []*executeQueryAction
+		if len(actionSequences) == 1 {
+			selectedActionSequence = actionSequences[0]
+		} else {
+			i, err := strconv.Atoi(req.Query)
+			if err != nil {
+				return err
+			}
+			selectedActionSequence = actionSequences[i]
+		}
+
+		actionQueue := make(chan *executeQueryAction, len(selectedActionSequence))
+		for _, action := range selectedActionSequence {
+			action.Validate()
+			actionQueue <- action
+		}
+
 		// Record the metadata
-		if (mdRecorder != nil) {
+		if mdRecorder != nil {
 			md, _ := metadata.FromIncomingContext(srv.Context())
 			mdRecorder <- md
 		}
@@ -617,7 +639,7 @@ func mockExecuteQueryFnWithMetadata(recorder chan<- *executeQueryReqRecord, mdRe
 				}
 				return gs.Error(action.rpcError, "ExecuteQuery failed")
 			}
-	
+
 			srv.Send(action.response)
 
 			if action.endOfStream {
